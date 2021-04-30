@@ -5,6 +5,7 @@ import os
 import requests
 from lxml import html
 import re
+import datetime
 
 import datetime
 import astropy.coordinates
@@ -16,6 +17,10 @@ import numpy as np
 import matplotlib.pyplot as plt
 from operator import itemgetter, attrgetter
 from random import randint
+from sqlalchemy import create_engine, MetaData
+from sqlalchemy.orm import sessionmaker
+from rts2solib import rts2comm, queue
+from rts2solib import scriptcomm
 
 #what will happen:
 #	a trigger will come in
@@ -77,20 +82,21 @@ class telescope:
 		pass
 
 
-class queue:
-	def __init__(self):
-		self.date = None
-		self.queue_objs = []
-		pass
+#class queue:
+#	def __init__(self):
+#		self.date = None
+#		self.queue_objs = []
+#		pass
 
 
 class queue_obj:
-	def __init__(self, name, ra, dec, priority, exp_objs, constraints=None):
+	def __init__(self, name, ra, dec, priority, exp_objs, constraints=None, rts2ids=[]):
 		self.name = name
 		self.ra = ra
 		self.dec = dec
 		self.priority = priority
 		self.exp_objs = exp_objs
+		self.rts2ids = rts2ids
 		#self.skycoord = astropy.coordinates.SkyCoord(
 		#	ra=astropy.coordinates.Angle(self.ra),
 		#	dec=astropy.coordinates.Angle(self.dec)
@@ -119,6 +125,7 @@ class queue_obj:
 		for aa in self.altaz.secz:
 			if aa > 1:
 				airmasses.append(aa)
+		print(self.name, len(airmasses))
 		if len(airmasses):
 			if setpeak:
 				self.peak_airmass = min(airmasses)
@@ -220,6 +227,72 @@ def formatcoord(coord):
 		coord = coord.split("-")[1]
 		return "-{}d{}m{}s".format(coord[0:2],coord[2:4],coord[4:])
 	return  "{}d{}m{}s".format(coord[0:2],coord[2:4],coord[4:])
+
+
+
+def orp_session():
+    orpdbpath = 'postgresql+psycopg2://artn:ArTn_520@scopenet.as.arizona.edu'
+    engine = create_engine(orpdbpath)
+    meta = MetaData()
+    meta.reflect(bind=engine)
+    session = sessionmaker(bind=engine)()
+
+    return meta, session
+
+
+def orp_targets(queued_iso=datetime.datetime(2021, 3, 22)):
+    
+    queued_iso_end = queued_iso + datetime.timedelta(days=6)
+    meta, session = orp_session()
+    obsreqs = meta.tables['obsreqs']
+    obs_col = meta.tables['obsreqs'].columns
+
+    db_resp = session.query(obsreqs).filter(
+            obs_col['queued']==True,
+            #obs_col['completed']==False,
+            obs_col['queued_iso'] > queued_iso,
+            obs_col['queued_iso'] < queued_iso_end
+        ).all()
+
+    '''Dirty way to group obsreqs'''
+    target_names = []
+    for resp in db_resp:
+        objname = resp.object_name
+        if '.us.' in objname:
+            objname = objname.split('.us.')[0]
+        target_names.append(objname)
+    target_names = list(set(target_names))
+
+    return_data = []
+    for t in target_names:
+        observations = [x for x in db_resp if t in x.object_name]
+        ob1 = observations[0]
+        observation_infos = []
+        rts2ids = []
+        for ob in observations:
+            rts2ids.append(int(ob.rts2_id))
+            observation_infos.append(
+                    exp_obj(
+                        ob.num_exp,
+                        ob.filter_name,
+                        ob.exp_time
+                    )
+                )
+        q = queue_obj(
+                t,
+                ob1.ra_hms,
+                ob1.dec_dms,
+                5,
+                observation_infos,
+                queue_obj_constraints(
+                    moon_distance_threshold=10, 
+                    airmass_threshold=float(ob1.airmass)    
+                ),
+                rts2ids = rts2ids
+            )
+        return_data.append(q)
+
+    return return_data
 
 
 def readfromweb():
@@ -330,8 +403,64 @@ def aztecTargs03222021():
 	]
 	return targs
 
+class FFTarget():
 
-def observing_schedule(targets, nightrange, midnight, location):
+    def __init__(self, targ, frame):
+        self.id = targ[0][0]
+        self.name = targ[0][1]
+        self.ra = targ[0][2]
+        self.dec = targ[0][3]
+
+        self._setSkyCoord()
+        self._setAltAz(frame)
+
+    def _setSkyCoord(self):
+        self.skycoord = astropy.coordinates.SkyCoord(ra = self.ra*u.degree, dec = self.dec*u.degree)
+
+    def _setAltAz(self, frame):
+        self.altaz = self.skycoord.transform_to(frame)
+
+    def dump(self):
+        for key, value in self.__dict__.items():
+            print('{}: {}, {}'.format(key, value, type(value)))
+
+def FocusRunDecider(frame, frame_night):
+    FOCUS_FIELD_IDS = [3611, 3612, 3613, 3614, 3615, 3616, 3617, 3618, 3619, 3620, 3621, 3622, 3623, 3624]
+    com = rts2comm()
+    focus_field_targets = {}
+
+    for _id in FOCUS_FIELD_IDS:
+        t = com.get_target(_id)
+        fft = FFTarget(t, frame)
+        secz = fft.altaz.secz
+
+        if secz > 0.0 and secz < 3:
+            print(secz, fft.name)
+            focus_field_targets[str(secz)] = fft
+
+    lowest_secz = min(list(focus_field_targets.keys()))
+    focus_field = focus_field_targets[lowest_secz]
+    
+    return_field = queue_obj(
+        focus_field.name,
+        focus_field.ra, focus_field.dec,
+        0,
+        [
+                exp_obj(2, 'V', 30),
+        ],
+        queue_obj_constraints(
+            moon_distance_threshold=1,
+            airmass_threshold=float(3.0)
+        ),
+        rts2ids = [focus_field.id]
+    )
+    return_field.skycoord = focus_field.skycoord
+    return_field.set_altaz(frame_night, setpeak=True)
+    
+    return return_field
+
+
+def observing_schedule(targets, nightrange, midnight, location, frame_night):
 
 	#First method:
 	#	split the observability night range into a number of hours
@@ -365,7 +494,7 @@ def observing_schedule(targets, nightrange, midnight, location):
 		#get all unscheduled targets
 
 		unscheduled_targets = [t for t in unscheduled_targets if not t.scheduled]
-		hour = ni+1
+		hour = ni+1           
 
 		#find the hour intervals
 		#	if it is the last interval
@@ -381,7 +510,17 @@ def observing_schedule(targets, nightrange, midnight, location):
 		frame = astropy.coordinates.AltAz(
 			obstime=frame_hours,
 			location=location
-		)
+		);
+		focus_frame = astropy.coordinates.AltAz(
+			obstime=frame_hours[0],
+			location=location
+		);
+
+		if ni == 0 or ni == int(hour_intervals/2.0):
+			focus_field = FocusRunDecider(focus_frame, frame_night)
+			#focus_field.set_altaz(frame_night, setpeak=True)
+			unscheduled_targets.append(focus_field)
+
 		[t.set_altaz(frame) for t in unscheduled_targets]
 
 		#do something with constraints: boolean observable = T/F?
@@ -395,7 +534,7 @@ def observing_schedule(targets, nightrange, midnight, location):
 		#	set thos at the top to be scheduled
 		#	-> do it again through all priorities
 
-		priority_range = [1,2,3,4,5]
+		priority_range = [0,1,2,3,4,5]
 
 		for p in priority_range:
 
@@ -450,12 +589,14 @@ def main():
 
 	big2 = astropy.coordinates.EarthLocation.of_site('mtbigelow')
 
-	#targets = readfromweb()
-	targets = aztecTargs03222021()
+	targets = orp_targets()#queued_iso=datetime.datetime.now())
+	#targets = aztecTargs03222021()targets = orp_targets()
 
 
 	utcoffset = 7*astropy.units.hour
+
 	d = datetime.datetime.now()
+	#d = datetime.datetime(2021, 3, 22)
 
 	midnight = astropy.time.Time('{}-{}-{} 00:00:00'.format(d.year, d.month, d.day)) + utcoffset
 	
@@ -487,7 +628,7 @@ def main():
 		if x:
 			astronomical_night.append(delta_midnight[i])
 
-	scheduled_targets = observing_schedule(targets=targets, nightrange=astronomical_night, midnight=midnight, location=big2)
+	scheduled_targets = observing_schedule(targets=targets, nightrange=astronomical_night, midnight=midnight, location=big2, frame_night=frame_night)
 
 	moon_delta_midnight = []
 	moon_airmass = []
@@ -555,6 +696,24 @@ def main():
 	plt.xlabel('Hours from EDT Midnight')
 	plt.ylabel('Airmass')
 	plt.show()
+
+	#populate_rts2_queue(scheduled_targets)
+
+
+def populate_rts2_queue(scheduled_targets, set_queue='plan'):
+    q = queue.Queue(set_queue)
+    print('Clearing current Queue')
+    q.load()
+    q.clear()
+    print('Scheduling')
+    for t in scheduled_targets:
+        print(t.name)
+        rts2ids = t.rts2ids
+        for rid in t.rts2ids:
+            print('   ', rid)
+            q.add_target(rid)
+
+    print('Queue populated')
 
 
 def oldmain():
